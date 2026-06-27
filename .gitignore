@@ -1,8 +1,8 @@
 # Xcode
 .build/
 .swiftpm/
-*.xcodeproj/xcuserdata/
-*.xcodeproj/project.xcworkspace/xcuserdata/
+**/xcuserdata/
+*.xcuserstate
 DerivedData/
 
 # macOS
