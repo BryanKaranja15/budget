@@ -2450,6 +2450,9 @@ private struct TransactionsPageView: View {
     @State private var days: [TransactionDay] = TransactionsPageView.makeDays()
     @State private var editing: EditTarget?            // which row's category is being changed
     @State private var showGroupScan = false
+    /// Charges that have been split into line items (id → items). A split charge no longer
+    /// shows the selection circle — it's resolved, so it renders as its line items instead.
+    @State private var splits: [UUID: [ReceiptLineItem]] = [:]
 
     /// Locates a transaction row by day + row index for recategorization.
     struct EditTarget: Identifiable {
@@ -2532,7 +2535,10 @@ private struct TransactionsPageView: View {
             if launch { showGroupScan = true; scanModel.launch = false }
         }
         .fullScreenCover(isPresented: $showGroupScan) {
-            BatchClassifySheet(transactions: selectedTransactions) {
+            BatchClassifySheet(transactions: selectedTransactions) { resolved in
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    splits.merge(resolved) { _, new in new }
+                }
                 scanModel.selected.removeAll()
             }
         }
@@ -2580,14 +2586,30 @@ private struct TransactionsPageView: View {
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(Palette.textSecondary)
                     ForEach(Array(day.rows.enumerated()), id: \.element.id) { rowIndex, row in
-                        TransactionListItem(
-                            row: row,
-                            isSelected: scanModel.selected.contains(row.id),
-                            onToggleSelect: row.isAmbiguous ? { toggleSelect(row.id) } : nil,
-                            onEditCategory: row.category == nil ? nil : {
-                                editing = EditTarget(dayIndex: dayIndex, rowIndex: rowIndex)
+                        if let items = splits[row.id] {
+                            // Resolved charge: show its line items (vendor — item, category,
+                            // price). No selection circle — it's already been split.
+                            ForEach(items) { item in
+                                TransactionListItem(
+                                    row: TransactionRow(
+                                        merchant: "\(row.merchant) — \(item.name)",
+                                        category: item.category,
+                                        amount: item.amount,
+                                        isIncome: false,
+                                        date: row.date
+                                    )
+                                )
                             }
-                        )
+                        } else {
+                            TransactionListItem(
+                                row: row,
+                                isSelected: scanModel.selected.contains(row.id),
+                                onToggleSelect: row.isAmbiguous ? { toggleSelect(row.id) } : nil,
+                                onEditCategory: row.category == nil ? nil : {
+                                    editing = EditTarget(dayIndex: dayIndex, rowIndex: rowIndex)
+                                }
+                            )
+                        }
                     }
                 }
             }
@@ -2656,7 +2678,9 @@ private struct TransactionListItem: View {
 /// each charge by the total on the online receipt.
 private struct BatchClassifySheet: View {
     let transactions: [TransactionRow]
-    var onDone: () -> Void
+    /// Hands back the line-item split for each charge (keyed by transaction id) so the list
+    /// can replace the ambiguous row with its resolved items.
+    var onDone: ([UUID: [ReceiptLineItem]]) -> Void
     @Environment(\.dismiss) private var dismiss
 
     enum Phase { case classify, analyzing, results }
@@ -2674,8 +2698,9 @@ private struct BatchClassifySheet: View {
     @State private var captureIndex = 0
     @State private var splitting = false            // split-review flow over the screenshot charges
     @State private var splitIndex = 0
+    @State private var results: [UUID: [ReceiptLineItem]] = [:]   // charge id → its split
 
-    init(transactions: [TransactionRow], onDone: @escaping () -> Void) {
+    init(transactions: [TransactionRow], onDone: @escaping ([UUID: [ReceiptLineItem]]) -> Void) {
         self.transactions = transactions
         self.onDone = onDone
         _queue = State(initialValue: transactions)
@@ -2704,7 +2729,8 @@ private struct BatchClassifySheet: View {
                 let t = imageList[captureIndex]
                 ReceiptCaptureSheet(merchant: t.merchant, total: t.amount, date: t.date,
                                     source: .camera, showCameraFirst: true,
-                                    continues: true) { _ in
+                                    continues: true) { items in
+                    results[t.id] = items
                     advanceCapture()
                 }
                 .id(captureIndex)   // fresh state per charge
@@ -2714,8 +2740,9 @@ private struct BatchClassifySheet: View {
         .fullScreenCover(isPresented: $splitting) {
             if splitIndex < screenshotList.count {
                 let t = screenshotList[splitIndex]
-                ReceiptCaptureSheet(merchant: t.merchant, total: t.amount,
-                                    source: .screenshot, continues: true) { _ in
+                ReceiptCaptureSheet(merchant: t.merchant, total: t.amount, date: t.date,
+                                    source: .screenshot, continues: true) { items in
+                    results[t.id] = items
                     advanceSplit()
                 }
                 .id(splitIndex)
@@ -3026,7 +3053,7 @@ private struct BatchClassifySheet: View {
                 .padding(.horizontal, 18)
                 .padding(.top, 70)
             }
-            Button(action: { onDone(); dismiss() }) {
+            Button(action: { onDone(results); dismiss() }) {
                 Text("Done")
                     .font(.system(size: 16, weight: .semibold))
                     .foregroundStyle(.white)
@@ -3160,7 +3187,7 @@ private struct BatchClassifySheet: View {
     private func finish() {
         UINotificationFeedbackGenerator().notificationOccurred(.success)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-            onDone()
+            onDone(results)
             dismiss()
         }
     }
